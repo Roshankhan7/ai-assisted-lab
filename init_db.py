@@ -11,7 +11,8 @@ cursor.execute("""
         company_name TEXT NOT NULL,
         job_role TEXT NOT NULL,
         application_date TEXT,
-        status TEXT
+        status TEXT,
+        interview_date TEXT
     )
 """)
 

@@ -1,7 +1,17 @@
-import sqlite3
 from pathlib import Path
 
 import streamlit as st
+
+from placement_store import (
+    add_application,
+    applications_to_csv,
+    delete_application,
+    initialize_database,
+    load_applications,
+    load_dashboard_data,
+    load_upcoming_interviews,
+    update_application_status,
+)
 
 
 DATABASE_PATH = Path(__file__).with_name("placements.db")
@@ -12,60 +22,6 @@ APPLICATION_STATUSES = [
     "Selected",
     "Rejected",
 ]
-
-
-def load_dashboard_data():
-    """Load applications and their summary information from SQLite."""
-    connection = sqlite3.connect(DATABASE_PATH)
-    connection.row_factory = sqlite3.Row
-
-    try:
-        applications = connection.execute(
-            """
-            SELECT application_id, company_name, job_role, application_date, status
-            FROM applications
-            ORDER BY application_id DESC
-            """
-        ).fetchall()
-        total_applications = connection.execute(
-            "SELECT COUNT(*) FROM applications"
-        ).fetchone()[0]
-        role_counts = connection.execute(
-            """
-            SELECT job_role, COUNT(*) AS application_count
-            FROM applications
-            WHERE job_role IS NOT NULL AND TRIM(job_role) != ''
-            GROUP BY job_role
-            """
-        ).fetchall()
-        status_counts = connection.execute(
-            """
-            SELECT status, COUNT(*) AS application_count
-            FROM applications
-            GROUP BY status
-            """
-        ).fetchall()
-    finally:
-        connection.close()
-
-    return applications, total_applications, role_counts, status_counts
-
-
-def add_application(company_name, job_role, application_date, status):
-    """Save one application to the database."""
-    connection = sqlite3.connect(DATABASE_PATH)
-
-    try:
-        connection.execute(
-            """
-            INSERT INTO applications (company_name, job_role, application_date, status)
-            VALUES (?, ?, ?, ?)
-            """,
-            (company_name, job_role, application_date, status),
-        )
-        connection.commit()
-    finally:
-        connection.close()
 
 
 def get_most_applied_roles(role_counts):
@@ -85,6 +41,7 @@ def get_most_applied_roles(role_counts):
 
 
 st.set_page_config(page_title="Placement Application Tracker", page_icon="📋")
+initialize_database(DATABASE_PATH)
 st.title("Placement Application Tracker")
 st.write("Keep track of your job applications and their progress.")
 
@@ -93,6 +50,9 @@ with st.form("add_application_form"):
     company_name = st.text_input("Company Name")
     job_role = st.text_input("Job Role")
     application_date = st.date_input("Application Date", format="YYYY-MM-DD")
+    interview_date = st.date_input(
+        "Interview Date (optional)", value=None, format="YYYY-MM-DD"
+    )
     status = st.selectbox("Status", APPLICATION_STATUSES)
     submitted = st.form_submit_button("Add Application")
 
@@ -104,17 +64,134 @@ if submitted:
         st.error("Please enter both a company name and a job role.")
     else:
         add_application(
+            DATABASE_PATH,
             company_name,
             job_role,
             application_date.isoformat(),
             status,
+            interview_date.isoformat() if interview_date else None,
         )
         st.success("Application added successfully.")
 
-st.subheader("Application Summary")
+st.subheader("View Applications")
+search_term = st.text_input("Search by company name")
+status_filter = st.selectbox(
+    "Filter by status",
+    ["All statuses", *APPLICATION_STATUSES, "Not specified"],
+)
+matching_applications = load_applications(
+    DATABASE_PATH,
+    search_term,
+    status_filter,
+)
 
-applications, total_applications, role_counts, saved_status_counts = (
-    load_dashboard_data()
+if matching_applications:
+    application_ids = [row["application_id"] for row in matching_applications]
+    with st.expander("Update an application status"):
+        with st.form("update_application_status_form"):
+            update_id = st.selectbox(
+                "Application",
+                application_ids,
+                format_func=lambda application_id: next(
+                    f"#{row['application_id']} - {row['company_name']} ({row['job_role']})"
+                    for row in matching_applications
+                    if row["application_id"] == application_id
+                ),
+                key="update_application_id",
+            )
+            current_status = next(
+                row["status"]
+                for row in matching_applications
+                if row["application_id"] == update_id
+            )
+            status_options = list(APPLICATION_STATUSES)
+            if current_status and current_status not in status_options:
+                status_options.insert(0, current_status)
+            selected_status = st.selectbox(
+                "New status",
+                status_options,
+                index=(
+                    status_options.index(current_status)
+                    if current_status in status_options
+                    else 0
+                ),
+            )
+            update_submitted = st.form_submit_button("Update Status")
+
+        if update_submitted:
+            if update_application_status(
+                DATABASE_PATH,
+                update_id,
+                selected_status,
+            ):
+                st.success("Application status updated.")
+            else:
+                st.error("The selected application could not be found.")
+
+    with st.expander("Delete an application"):
+        with st.form("delete_application_form"):
+            delete_id = st.selectbox(
+                "Application to delete",
+                application_ids,
+                format_func=lambda application_id: next(
+                    f"#{row['application_id']} - {row['company_name']} ({row['job_role']})"
+                    for row in matching_applications
+                    if row["application_id"] == application_id
+                ),
+                key="delete_application_id",
+            )
+            confirmed = st.checkbox(
+                f"I confirm deleting application #{delete_id} permanently."
+            )
+            delete_submitted = st.form_submit_button("Delete Application")
+
+        if delete_submitted:
+            if not confirmed:
+                st.error("Confirm the deletion before continuing.")
+            elif delete_application(DATABASE_PATH, delete_id):
+                st.success("Application deleted.")
+                matching_applications = load_applications(
+                    DATABASE_PATH,
+                    search_term,
+                    status_filter,
+                )
+            else:
+                st.error("The selected application could not be found.")
+
+applications = load_applications(
+    DATABASE_PATH,
+    search_term,
+    status_filter,
+)
+if applications:
+    st.download_button(
+        "Export matching applications as CSV",
+        data=applications_to_csv(applications),
+        file_name="placement_applications.csv",
+        mime="text/csv",
+    )
+    st.dataframe(
+        [dict(application) for application in applications],
+        hide_index=True,
+        width="stretch",
+    )
+else:
+    st.info("No applications are available yet. Add one using the form above.")
+
+st.subheader("Upcoming Interviews")
+upcoming_interviews = load_upcoming_interviews(DATABASE_PATH)
+if upcoming_interviews:
+    st.dataframe(
+        [dict(interview) for interview in upcoming_interviews],
+        hide_index=True,
+        width="stretch",
+    )
+else:
+    st.info("No upcoming interviews are scheduled.")
+
+st.subheader("Application Summary")
+_, total_applications, role_counts, saved_status_counts = load_dashboard_data(
+    DATABASE_PATH
 )
 st.metric("Total Applications", total_applications)
 
@@ -146,13 +223,3 @@ st.bar_chart(
     x="Status",
     y="Applications",
 )
-
-st.subheader("View Applications")
-if applications:
-    st.dataframe(
-        [dict(application) for application in applications],
-        hide_index=True,
-        use_container_width=True,
-    )
-else:
-    st.info("No applications are available yet. Add one using the form above.")
